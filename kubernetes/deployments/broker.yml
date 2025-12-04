@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wopi-server
+  namespace: wopi-services
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: wopi-server
+  template:
+    metadata:
+      labels:
+        app: wopi-server
+    spec:
+      containers:
+        - name: wopi-server
+          image: 116839935550.dkr.ecr.us-east-2.amazonaws.com/test-hyl-hob:broker
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ASPNETCORE_URLS
+              value: "http://0.0.0.0:8080"
+            - name: DB_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: wopi-database-secret
+                  key: connection_string
+            - name: REDIS_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: wopi-redis-secret
+                  key: redis_connection_string
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              dotnet /app/Wopi.dll \
+              --wopi:registrationdb="${DB_CONNECTION_STRING}" \
+              --wopi:redis="${REDIS_CONNECTION_STRING}" \
+              --wopi:officeonlineserverurl="https://office.hyland.com/appserverdemo/private"

@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wopi-config
+  namespace: wopi-services
+data:
+  OFFICE_ONLINE_SERVER_URL: "https://office.hyland.com/appserverdemo/private"
+  LOGGING_LEVEL: "Information"
+  vite.config.js: |
+    import { defineConfig } from 'vite';
+
+    export default defineConfig({
+      server: {
+        host: '0.0.0.0',
+        port: 3000,
+        allowedHosts: [
+          'localhost',
+          '.amazonaws.com',
+          'wopi.gov.hylandcloud.dev'
+        ],
+        hmr: {
+          host: 'localhost'
+        },
+        proxy: {
+          '/odata': {
+            target: 'http://wopi-backend-service:5001',
+            changeOrigin: true,
+            secure: false,
+            configure: (proxy, options) => {
+              proxy.on('proxyReq', (proxyReq, req, res) => {
+                // Only allow requests from the application itself (XHR/fetch), not direct browser access
+                const isXHR = req.headers['x-requested-with'] === 'XMLHttpRequest' ||
+                             req.headers['accept']?.includes('application/json') ||
+                             req.headers['content-type']?.includes('application/json');
+
+                const referer = req.headers['referer'];
+                const origin = req.headers['origin'];
+
+                // Block direct browser navigation to API endpoints
+                if (!isXHR && !referer) {
+                  proxyReq.destroy();
+                  res.writeHead(403, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: 'Direct API access not allowed' }));
+                }
+              });
+            }
+          },
+          '/api': {
+            target: 'http://wopi-backend-service:5001',
+            changeOrigin: true,
+            secure: false,
+            configure: (proxy, options) => {
+              proxy.on('proxyReq', (proxyReq, req, res) => {
+                // Only allow requests from the application itself (XHR/fetch), not direct browser access
+                const isXHR = req.headers['x-requested-with'] === 'XMLHttpRequest' ||
+                             req.headers['accept']?.includes('application/json') ||
+                             req.headers['content-type']?.includes('application/json');
+
+                const referer = req.headers['referer'];
+
+                // Block direct browser navigation to API endpoints
+                if (!isXHR && !referer) {
+                  proxyReq.destroy();
+                  res.writeHead(403, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: 'Direct API access not allowed' }));
+                }
+              });
+            }
+          }
+        }
+      }
+    })

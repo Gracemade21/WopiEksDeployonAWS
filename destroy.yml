@@ -1,0 +1,288 @@
+---
+# destroy.yml — HylandGov EKS Deployments
+
+- name: Setup workspace and assume role
+  block:
+    - name: Create working directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[IaC] Assume role in shared"
+      amazon.aws.sts_assume_role:
+        role_arn: "{{ aws_wopi_prod_role_arn }}"
+        role_session_name: "wopiDestroySession"
+        region: "us-east-1"
+      register: aws_assumed_role
+
+    - name: "[IaC] Run init"
+      ansible.builtin.command:
+        cmd: >
+          terraform init
+          -backend-config="bucket={{ tf_s3_bucket }}"
+          -backend-config="key=wopi/{{ cluster_name }}/terraform.tfstate"
+          -backend-config="region={{ region }}"
+          -backend-config="encrypt=true"
+        chdir: "{{ playbook_dir }}"
+      register: tf_init_result
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: "[IaC] Write the tfvars file"
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/terraform.tfvars.json"
+        content: "{{ tf_vars_input | to_nice_json }}"
+
+    - name: Debug cluster_name variable
+      debug:
+        msg: "Cluster name is: {{ cluster_name }}"
+
+    - name: "[IaC] List existing workspaces"
+      ansible.builtin.command:
+        cmd: "terraform workspace list"
+        chdir: "{{ playbook_dir }}"
+      register: workspace_list
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: Show existing workspaces
+      debug:
+        msg: "Available workspaces: {{ workspace_list.stdout }}"
+
+    - name: "[IaC] Create or select workspace"
+      ansible.builtin.command:
+        cmd: "terraform workspace select -or-create {{ cluster_name }}"
+        chdir: "{{ playbook_dir }}"
+      register: workspace_select
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: Show workspace selection result
+      debug:
+        msg: "Workspace selection: {{ workspace_select.stdout }}"
+
+    - name: "[IaC] Check current workspace"
+      ansible.builtin.command:
+        cmd: "terraform workspace show"
+        chdir: "{{ playbook_dir }}"
+      register: current_workspace
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: Show current workspace
+      debug:
+        msg: "Current workspace: {{ current_workspace.stdout }}"
+
+    - name: "[IaC] Check state list before destroy"
+      ansible.builtin.command:
+        cmd: "terraform state list"
+        chdir: "{{ playbook_dir }}"
+      register: state_list
+      ignore_errors: yes
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: Show resources in state
+      debug:
+        msg: "Resources in state: {{ state_list.stdout if state_list.rc == 0 else 'No state or empty state' }}"
+
+    - name: "[IaC] Check if EKS cluster exists in AWS"
+      ansible.builtin.command:
+        cmd: "aws eks describe-cluster --name {{ cluster_name }} --region us-east-1 --output json"
+      register: eks_cluster_check
+      ignore_errors: yes
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: Show EKS cluster status in AWS
+      debug:
+        msg: "EKS cluster {{ cluster_name }} exists in AWS: {{ eks_cluster_check.rc == 0 }}"
+
+    - name: Show cluster details if exists
+      debug:
+        msg: "Cluster details: {{ eks_cluster_check.stdout | from_json }}"
+      when: eks_cluster_check.rc == 0
+
+    - name: Show cluster error if not found
+      debug:
+        msg: "Cluster lookup error: {{ eks_cluster_check.stderr }}"
+      when: eks_cluster_check.rc != 0
+
+    - name: "[IaC] Try to import existing resources to state (if cluster exists)"
+      ansible.builtin.command:
+        cmd: "terraform import aws_eks_cluster.main {{ cluster_name }}"
+        chdir: "{{ playbook_dir }}"
+      when: eks_cluster_check.rc == 0
+      register: import_result
+      ignore_errors: yes
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: Show import result
+      debug:
+        msg: "Import result: {{ import_result.stdout if import_result is defined else 'Import not attempted' }}"
+      when: eks_cluster_check.rc == 0
+
+    - name: Show import error if failed
+      debug:
+        msg: "Import error: {{ import_result.stderr if import_result is defined and import_result.failed else 'No import error' }}"
+      when: eks_cluster_check.rc == 0
+
+    - name: "[IaC] Check state again after potential import"
+      ansible.builtin.command:
+        cmd: "terraform state list"
+        chdir: "{{ playbook_dir }}"
+      register: state_list_after_import
+      ignore_errors: yes
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: Show resources in state after import attempt
+      debug:
+        msg: "Resources in state after import: {{ state_list_after_import.stdout if state_list_after_import.rc == 0 else 'Still empty' }}"
+
+    - name: "[IaC] Manual cluster deletion if Terraform can't handle it"
+      block:
+        - name: Get cluster node groups
+          ansible.builtin.command:
+            cmd: "aws eks list-nodegroups --cluster-name {{ cluster_name }} --region us-east-1 --output json"
+          register: nodegroups_list
+          ignore_errors: yes
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Show node groups
+          debug:
+            msg: "Node groups: {{ (nodegroups_list.stdout | from_json).nodegroups if nodegroups_list.rc == 0 else 'No node groups or error' }}"
+
+        - name: Delete node groups first (if any exist)
+          ansible.builtin.command:
+            cmd: "aws eks delete-nodegroup --cluster-name {{ cluster_name }} --nodegroup-name {{ item }} --region us-east-1"
+          loop: "{{ (nodegroups_list.stdout | from_json).nodegroups if nodegroups_list.rc == 0 else [] }}"
+          register: nodegroup_deletion
+          ignore_errors: yes
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Wait for node groups to be deleted
+          ansible.builtin.command:
+            cmd: "aws eks wait nodegroup-deleted --cluster-name {{ cluster_name }} --nodegroup-name {{ item }} --region us-east-1"
+          loop: "{{ (nodegroups_list.stdout | from_json).nodegroups if nodegroups_list.rc == 0 else [] }}"
+          ignore_errors: yes
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Delete the EKS cluster directly
+          ansible.builtin.command:
+            cmd: "aws eks delete-cluster --name {{ cluster_name }} --region us-east-1"
+          register: cluster_deletion
+          ignore_errors: yes
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Wait for cluster deletion to complete
+          ansible.builtin.command:
+            cmd: "aws eks wait cluster-deleted --name {{ cluster_name }} --region us-east-1"
+          ignore_errors: yes
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Show cluster deletion result
+          debug:
+            msg: "EKS cluster {{ cluster_name }} deletion initiated. Result: {{ cluster_deletion.stdout }}"
+
+        - name: Manual cleanup warning
+          debug:
+            msg: "WARNING: Cluster {{ cluster_name }} existed in AWS but not in Terraform state. It has been deleted directly via AWS CLI."
+      when:
+        - eks_cluster_check.rc == 0
+        - state_list_after_import.stdout == ""
+
+    - name: "[IaC] Run destroy"
+      ansible.builtin.command:
+        cmd: "terraform destroy -var-file=terraform.tfvars.json -input=false -auto-approve=true -no-color"
+        chdir: "{{ playbook_dir }}"
+      register: tf_destroy_result
+      ignore_errors: yes
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: "[IaC] Validate destroy success"
+      ansible.builtin.assert:
+        that: not tf_destroy_result['failed']
+        fail_msg: "Destroy failed.. '{{ tf_destroy_result.stdout }} stderr: {{ tf_destroy_result.stderr }}'"
+        success_msg: "Destroy is success. {{ tf_destroy_result.stdout }}"
+
+    - name: "[IaC] Clean up workspace if no resources exist"
+      block:
+        - name: Check if workspace is empty
+          ansible.builtin.command:
+            cmd: "terraform state list"
+            chdir: "{{ playbook_dir }}"
+          register: final_state_check
+          ignore_errors: yes
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Delete empty workspace
+          ansible.builtin.command:
+            cmd: "terraform workspace select default && terraform workspace delete {{ cluster_name }}"
+            chdir: "{{ playbook_dir }}"
+          when: final_state_check.stdout == ""
+          ignore_errors: yes
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Workspace cleanup result
+          debug:
+            msg: "Workspace {{ cluster_name }} cleaned up successfully - no resources were found to destroy"
+          when: final_state_check.stdout == ""

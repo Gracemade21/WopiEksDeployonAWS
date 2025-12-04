@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wopi-frontend
+  namespace: wopi-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wopi-frontend
+  template:
+    metadata:
+      labels:
+        app: wopi-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: 116839935550.dkr.ecr.us-east-2.amazonaws.com/test-hyl-hob:frontend
+          ports:
+            - containerPort: 3000
+          env:
+            - name: VITE_API_SERVER_URL
+              value: ""
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Copy our custom vite config with restricted proxy
+              cp /config/vite.config.js /app/vite.config.js
+
+              # Set environment for relative API URLs (will use proxy)
+              echo 'VITE_API_SERVER_URL=""' > /app/.env
+
+              echo "Starting frontend with restricted proxy"
+              echo "API calls from app are proxied to internal backend"
+              echo "Direct browser access to API endpoints is blocked"
+
+              # Start the dev server
+              npm run dev
+          volumeMounts:
+            - name: vite-config
+              mountPath: /config
+      volumes:
+        - name: vite-config
+          configMap:
+            name: wopi-config
+            items:
+              - key: vite.config.js
+                path: vite.config.js

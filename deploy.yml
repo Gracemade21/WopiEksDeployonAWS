@@ -1,0 +1,122 @@
+- name: Setup git and checkout repo
+  block:
+    - name: Create a directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[IaC] Assume role in shared"
+      amazon.aws.sts_assume_role:
+        role_arn: "{{ aws_wopi_prod_role_arn }}"
+        role_session_name: "wopiSession"
+        region: "us-east-1"
+      register: aws_assumed_role
+
+    - name: "[IaC] Run init"
+      ansible.builtin.command:
+        cmd: >
+          terraform init
+          -backend-config="bucket={{ tf_s3_bucket }}"
+          -backend-config="key=wopi/{{ cluster_name }}/terraform.tfstate"
+          -backend-config="region={{ region }}"
+          -backend-config="encrypt=true"
+        chdir: "{{ playbook_dir }}"
+      register: tf_init_result
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: "[IaC] Write the tfvars file"
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/terraform.tfvars.json"
+        content: "{{ tf_vars_input | to_nice_json }}"
+
+    - name: "[IaC] Create a workspace"
+      ansible.builtin.command:
+        cmd: "terraform workspace select -or-create {{ cluster_name }}"
+        chdir: "{{ playbook_dir }}"
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: "[IaC] Terraform plan"
+      block:
+        - name: "[IaC] Run plan"
+          ansible.builtin.command:
+            cmd: "terraform plan -var-file=terraform.tfvars.json -out=tfplan"
+            chdir: "{{ playbook_dir }}"
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: "[IaC] Register json output"
+      ansible.builtin.command:
+        cmd: terraform show -json tfplan -no-color
+        chdir: "{{ playbook_dir }}"
+      register: tf_show_plan_result
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
+
+    - name: Output the plan before apply
+      debug:
+        msg: "{{ tf_show_plan_result.stdout }}"
+
+    - name: Terraform apply
+      block:
+        - name: "[IaC] Run apply"
+          ansible.builtin.command:
+            cmd: terraform apply -json -input=false -auto-approve=true tfplan -no-color
+            chdir: "{{ playbook_dir }}"
+          register: tf_apply_result
+          ignore_errors: yes
+
+        - name: "[IaC] Validate apply success"
+          ansible.builtin.assert:
+            that: not tf_apply_result['failed']
+            fail_msg: "Apply failed.. '{{ tf_apply_result.stdout }} break {{ tf_apply_result.stderr }}'"
+            success_msg: "Apply is success. {{ tf_apply_result.stdout }}"
+
+        - name: "[IaC] Verify resources were created in state"
+          ansible.builtin.command:
+            cmd: "terraform state list"
+            chdir: "{{ playbook_dir }}"
+          register: post_apply_state_list
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Show resources created
+          debug:
+            msg: "Resources created and tracked in state: {{ post_apply_state_list.stdout }}"
+
+        - name: "[IaC] Verify EKS cluster exists in AWS"
+          ansible.builtin.command:
+            cmd: "aws eks describe-cluster --name {{ cluster_name }} --region us-east-1"
+          register: eks_verify
+          ignore_errors: yes
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+            AWS_REGION: "us-east-1"
+
+        - name: Confirm EKS cluster deployment
+          debug:
+            msg: "EKS cluster {{ cluster_name }} successfully created: {{ eks_verify.rc == 0 }}"
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
+        AWS_REGION: "us-east-1"
