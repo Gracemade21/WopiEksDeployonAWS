@@ -1,0 +1,229 @@
+---
+# Terraform destroy tasks
+
+- name: Check state before destroy
+  ansible.builtin.command:
+    cmd: "terraform state list"
+    chdir: "{{ playbook_dir }}"
+  register: pre_destroy_state
+  ignore_errors: true
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ region }}"
+  tags: [terraform, state]
+
+- name: Display resources to be destroyed
+  ansible.builtin.debug:
+    msg: |
+      Resources in state (to be destroyed):
+      {{ pre_destroy_state.stdout_lines | default(['No resources found']) }}
+  tags: [terraform, state]
+
+- name: Check if no resources exist
+  ansible.builtin.set_fact:
+    state_is_empty: "{{ pre_destroy_state.stdout == '' or pre_destroy_state.rc != 0 }}"
+  tags: [terraform, state]
+
+- name: Verify EKS cluster exists in AWS
+  ansible.builtin.command:
+    cmd: "aws eks describe-cluster --name {{ cluster_name }} --region {{ aws_region }} --output json"
+  register: eks_exists_check
+  ignore_errors: true
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ aws_region }}"
+  tags: [verify, eks]
+
+- name: Display cluster existence status
+  ansible.builtin.debug:
+    msg: "EKS cluster '{{ cluster_name }}' {{ 'exists' if eks_exists_check.rc == 0 else 'does not exist' }} in AWS"
+  tags: [verify, eks]
+
+# Handle case where cluster exists but not in state
+- name: Handle orphaned cluster
+  when: 
+    - eks_exists_check.rc == 0
+    - state_is_empty
+  block:
+    - name: Warning about orphaned cluster
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Cluster {{ cluster_name }} exists in AWS but not in Terraform state.
+          This may be an orphaned resource or state mismatch.
+      
+    - name: Prompt for manual cleanup confirmation
+      ansible.builtin.pause:
+        prompt: |
+          Cluster exists but not in state. Options:
+          1. Manual cleanup required
+          2. Attempt AWS CLI cleanup (destructive)
+          Press Ctrl+C to abort, Enter to continue with AWS CLI cleanup
+      when: force_cleanup | default(false) == false
+
+    - name: Cleanup orphaned cluster via AWS CLI
+      ansible.builtin.include_tasks: aws-cleanup.yml
+      when: force_cleanup | default(false) or cleanup_confirmed | default(false)
+
+- name: Run Terraform destroy plan
+  ansible.builtin.command:
+    cmd: >
+      terraform plan -destroy
+      -var-file=terraform.tfvars.json
+      -out=destroy-plan
+    chdir: "{{ playbook_dir }}"
+  register: tf_destroy_plan
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ region }}"
+  when: not state_is_empty
+  tags: [terraform, plan, destroy]
+
+- name: Display destroy plan
+  ansible.builtin.debug:
+    msg: "{{ tf_destroy_plan.stdout_lines }}"
+  when: 
+    - not state_is_empty
+    - show_destroy_plan | default(true)
+  tags: [terraform, plan, destroy]
+
+# Stop here if dry-run mode
+- name: Exit if dry-run mode
+  ansible.builtin.meta: end_play
+  when: dry_run | default(false)
+
+- name: Skip destroy if state is empty
+  when: state_is_empty
+  block:
+    - name: State is empty message
+      ansible.builtin.debug:
+        msg: "No resources to destroy. State is empty or doesn't exist."
+    
+    - name: End play for empty state
+      ansible.builtin.meta: end_play
+
+- name: Execute Terraform destroy
+  block:
+    - name: Run terraform destroy
+      ansible.builtin.command:
+        cmd: >
+          terraform destroy
+          -var-file=terraform.tfvars.json
+          -auto-approve
+        chdir: "{{ playbook_dir }}"
+      register: tf_destroy_result
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+      tags: [terraform, destroy]
+
+    - name: Validate destroy success
+      ansible.builtin.assert:
+        that: not tf_destroy_result.failed
+        fail_msg: "Terraform destroy failed: {{ tf_destroy_result.stderr }}"
+        success_msg: "Terraform destroy completed successfully"
+      tags: [terraform, destroy]
+
+    - name: Verify state is empty
+      ansible.builtin.command:
+        cmd: "terraform state list"
+        chdir: "{{ playbook_dir }}"
+      register: post_destroy_state
+      ignore_errors: true
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+      tags: [terraform, verify]
+
+    - name: Display post-destroy state
+      ansible.builtin.debug:
+        msg: |
+          Resources remaining: {{ post_destroy_state.stdout_lines | default(['None']) }}
+          State status: {{ 'Clean' if post_destroy_state.stdout == '' else 'Contains resources' }}
+      tags: [terraform, verify]
+
+    - name: Verify cluster is destroyed
+      ansible.builtin.command:
+        cmd: "aws eks describe-cluster --name {{ cluster_name }} --region {{ aws_region }}"
+      register: eks_post_destroy
+      ignore_errors: true
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ aws_region }}"
+      tags: [verify, eks]
+
+    - name: Confirm cluster deletion
+      ansible.builtin.debug:
+        msg: "Cluster {{ cluster_name }} {{ 'still exists (unexpected)' if eks_post_destroy.rc == 0 else 'successfully destroyed' }}"
+      tags: [verify, eks]
+
+  rescue:
+    - name: Destroy failed - capture details
+      ansible.builtin.set_fact:
+        destroy_error: "{{ tf_destroy_result.stderr | default('Unknown error') }}"
+
+    - name: Display error information
+      ansible.builtin.debug:
+        msg: "Destroy failed: {{ destroy_error }}"
+
+    - name: Check for remaining resources
+      ansible.builtin.command:
+        cmd: "terraform state list"
+        chdir: "{{ playbook_dir }}"
+      register: failed_destroy_state
+      ignore_errors: true
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+
+    - name: Report stuck resources
+      ansible.builtin.debug:
+        msg: |
+          Failed to destroy. Resources still in state:
+          {{ failed_destroy_state.stdout_lines | default(['Unable to check']) }}
+      
+    - name: Fail the play
+      ansible.builtin.fail:
+        msg: "Terraform destroy failed. Manual intervention may be required."
+
+- name: Clean up workspace (optional)
+  when: 
+    - cleanup_workspace | default(false)
+    - post_destroy_state.stdout == ''
+  block:
+    - name: Switch to default workspace
+      ansible.builtin.command:
+        cmd: "terraform workspace select default"
+        chdir: "{{ playbook_dir }}"
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+
+    - name: Delete empty workspace
+      ansible.builtin.command:
+        cmd: "terraform workspace delete {{ cluster_name }}"
+        chdir: "{{ playbook_dir }}"
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+
+    - name: Workspace cleanup complete
+      ansible.builtin.debug:
+        msg: "Workspace {{ cluster_name }} deleted successfully"

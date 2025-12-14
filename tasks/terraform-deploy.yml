@@ -1,0 +1,151 @@
+---
+# Terraform deployment tasks
+
+- name: Run Terraform plan
+  ansible.builtin.command:
+    cmd: >
+      terraform plan 
+      -var-file={{ playbook_dir }}/terraform/terraform.tfvars.json
+      -out=tfplan
+      {{ '-detailed-exitcode' if validate_only | default(false) else '' }}
+    chdir: "{{ playbook_dir }}/terraform"
+  register: tf_plan_result
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ region }}"
+  failed_when: tf_plan_result.rc not in [0, 2]
+  tags: [terraform, plan]
+
+- name: Interpret plan results
+  ansible.builtin.set_fact:
+    plan_has_changes: "{{ tf_plan_result.rc == 2 }}"
+    plan_no_changes: "{{ tf_plan_result.rc == 0 }}"
+  tags: [terraform, plan]
+
+- name: Display plan summary
+  ansible.builtin.debug:
+    msg: |
+      Plan Status: {{ 'Changes detected' if plan_has_changes else 'No changes' }}
+      {{ 'Terraform will modify infrastructure' if plan_has_changes else 'Infrastructure matches desired state' }}
+  tags: [terraform, plan]
+
+- name: Generate JSON plan output
+  ansible.builtin.command:
+    cmd: terraform show -json tfplan
+    chdir: "{{ playbook_dir }}/terraform"
+  register: tf_show_plan_result
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ region }}"
+  tags: [terraform, plan]
+
+- name: Save plan to file (optional)
+  ansible.builtin.copy:
+    content: "{{ tf_show_plan_result.stdout }}"
+    dest: "{{ playbook_dir }}/plan-{{ ansible_date_time.iso8601_basic_short }}.json"
+    mode: "0644"
+  when: save_plan | default(false)
+  tags: [terraform, plan]
+
+- name: Display plan preview
+  ansible.builtin.debug:
+    msg: "{{ tf_show_plan_result.stdout | from_json }}"
+  when: show_plan_details | default(false)
+  tags: [terraform, plan]
+
+# Stop here if dry-run mode or validation only
+- name: Exit if dry-run mode
+  ansible.builtin.meta: end_play
+  when: dry_run | default(false) or validate_only | default(false)
+
+# Stop if no changes and skip_if_no_changes is set
+- name: Skip apply if no changes
+  ansible.builtin.debug:
+    msg: "No changes to apply. Skipping terraform apply."
+  when:
+    - plan_no_changes
+    - skip_if_no_changes | default(false)
+
+- name: End play if no changes and skip enabled
+  ansible.builtin.meta: end_play
+  when:
+    - plan_no_changes
+    - skip_if_no_changes | default(false)
+
+- name: Apply Terraform plan
+  block:
+    - name: Execute terraform apply
+      ansible.builtin.command:
+        cmd: terraform apply -auto-approve tfplan
+        chdir: "{{ playbook_dir }}/terraform"
+      register: tf_apply_result
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+      tags: [terraform, apply]
+
+    - name: Validate apply success
+      ansible.builtin.assert:
+        that: not tf_apply_result.failed
+        fail_msg: "Terraform apply failed: {{ tf_apply_result.stderr }}"
+        success_msg: "Terraform apply completed successfully"
+      tags: [terraform, apply]
+
+    - name: Verify resources in state
+      ansible.builtin.command:
+        cmd: "terraform state list"
+        chdir: "{{ playbook_dir }}/terraform"
+      register: post_apply_state_list
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+      tags: [terraform, verify]
+
+    - name: Display created resources
+      ansible.builtin.debug:
+        msg: "Resources in state: {{ post_apply_state_list.stdout_lines }}"
+      tags: [terraform, verify]
+
+    - name: Verify EKS cluster exists
+      ansible.builtin.command:
+        cmd: "aws eks describe-cluster --name {{ cluster_name }} --region {{ aws_region }} --output json"
+      register: eks_verify
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ aws_region }}"
+      tags: [verify, eks]
+
+    - name: Display EKS cluster status
+      ansible.builtin.debug:
+        msg: |
+          Cluster: {{ cluster_name }}
+          Status: {{ (eks_verify.stdout | from_json).cluster.status }}
+          Endpoint: {{ (eks_verify.stdout | from_json).cluster.endpoint }}
+      tags: [verify, eks]
+
+  rescue:
+    - name: Apply failed - capture error details
+      ansible.builtin.set_fact:
+        apply_error: "{{ tf_apply_result.stderr | default('Unknown error') }}"
+
+    - name: Display error information
+      ansible.builtin.debug:
+        msg: "Apply failed: {{ apply_error }}"
+
+    - name: Trigger rollback if enabled
+      ansible.builtin.include_tasks: terraform-rollback.yml
+      when: enable_rollback | default(false)
+
+    - name: Fail the play
+      ansible.builtin.fail:
+        msg: "Terraform apply failed. Check logs for details."

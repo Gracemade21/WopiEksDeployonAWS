@@ -7,16 +7,11 @@ private_subnet_ids = ["subnet-048742a3c8dd5a91a", "subnet-0291efa03f8c2438d"]
 vpc_cidr           = "10.0.0.0/16"
 log_retention_days = 14
 
-# Database
-db_allocated_storage       = 20
-db_max_allocated_storage   = 100
-db_engine_version          = "15.00.4365.2.v1"
-db_instance_class          = "db.t3.micro"
-db_backup_retention_period = 7
-db_backup_window           = "03:00-04:00"
-db_maintenance_window      = "Sun:04:00-Sun:05:00"
-skip_final_snapshot        = true
-deletion_protection        = false
+# External Database Configuration (SQL Server AG)
+db_secret_name = "wopi/database/credential-dev" # UPDATE THIS with your actual secret name
+db_host        = "db-wopi"                      # Geo DNS alias for AG (ric-vmdb763/764)
+db_port        = 1433
+db_name        = "wopi"
 
 # Redis
 redis_node_type          = "cache.t3.micro"
@@ -25,5 +20,5 @@ redis_num_cache_clusters = 1
 
 tags = {
   Environment = "dev"
-  Team        = "Platform"
+  ManagedBy   = "Terraform"
 }

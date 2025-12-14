@@ -1,0 +1,92 @@
+---
+# Common Terraform tasks used across deploy and destroy operations
+
+- name: Create working directory
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Assume AWS role
+  amazon.aws.sts_assume_role:
+    role_arn: "{{ aws_wopi_prod_role_arn }}"
+    role_session_name: "wopiSession-{{ cluster_name }}-{{ operation | default('general') }}"
+    region: "{{ region }}"
+  register: aws_assumed_role
+  tags: [always]
+
+- name: Set AWS credentials as facts
+  ansible.builtin.set_fact:
+    aws_access_key: "{{ aws_assumed_role.sts_creds.access_key }}"
+    aws_secret_key: "{{ aws_assumed_role.sts_creds.secret_key }}"
+    aws_session_token: "{{ aws_assumed_role.sts_creds.session_token }}"
+  no_log: true
+  tags: [always]
+
+- name: Initialize Terraform
+  ansible.builtin.command:
+    cmd: >
+      terraform init
+      -backend-config="bucket={{ tf_s3_bucket }}"
+      -backend-config="key=wopi/{{ cluster_name }}/terraform.tfstate"
+      -backend-config="region={{ region }}"
+      -backend-config="encrypt=true"
+    chdir: "{{ playbook_dir }}/terraform"
+  register: tf_init_result
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ region }}"
+  tags: [terraform, init]
+
+- name: Display init results
+  ansible.builtin.debug:
+    msg: "Terraform initialization: {{ 'SUCCESS' if tf_init_result.rc == 0 else 'FAILED' }}"
+  tags: [terraform, init]
+- name: Build clean Terraform variables (filter out proxy vars)
+  ansible.builtin.set_fact:
+    tf_vars_clean: "{{ tf_vars_input | dict2items | rejectattr('key', 'match', '^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)$') | items2dict }}"
+  tags: [terraform, vars]
+
+- name: Write Terraform variables file
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/terraform/terraform.tfvars.json"
+    content: "{{ tf_vars_input | to_nice_json }}"
+    mode: "0644"
+  tags: [terraform, vars]
+
+- name: Display what's written to tfvars
+  ansible.builtin.debug:
+    msg: "{{ tf_vars_input | to_nice_json }}"
+    verbose: 1
+  tags: [terraform, vars]
+
+- name: Select or create Terraform workspace
+  ansible.builtin.command:
+    cmd: "terraform workspace select -or-create {{ cluster_name }}"
+    chdir: "{{ playbook_dir }}"
+  register: workspace_select
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ region }}"
+  tags: [terraform, workspace]
+
+- name: Verify current workspace
+  ansible.builtin.command:
+    cmd: "terraform workspace show"
+    chdir: "{{ playbook_dir }}"
+  register: current_workspace
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ region }}"
+  tags: [terraform, workspace]
+
+- name: Display current workspace
+  ansible.builtin.debug:
+    msg: "Operating in workspace: {{ current_workspace.stdout }}"
+  tags: [terraform, workspace]

@@ -1,122 +1,258 @@
-- name: Setup git and checkout repo
-  block:
-    - name: Create a directory
-      ansible.builtin.file:
-        path: "{{ playbook_dir }}"
-        state: directory
-        mode: "0755"
+﻿---
+# Complete deployment: Infrastructure + Applications (kubectl version)
+- name: WOPI Complete Deployment
+  hosts: localhost
+  connection: local
+  gather_facts: true
 
-    - name: "[IaC] Assume role in shared"
-      amazon.aws.sts_assume_role:
-        role_arn: "{{ aws_wopi_prod_role_arn }}"
-        role_session_name: "wopiSession"
-        region: "us-east-1"
-      register: aws_assumed_role
+  vars:
+    operation: "deploy"
+    env: "{{ tower_environment | default(environment | default('prod')) }}"
+    deploy_apps: "{{ deploy | default(true) }}"
+    k8s_manifest_dir: "{{ playbook_dir }}/kubernetes"
 
-    - name: "[IaC] Run init"
-      ansible.builtin.command:
-        cmd: >
-          terraform init
-          -backend-config="bucket={{ tf_s3_bucket }}"
-          -backend-config="key=wopi/{{ cluster_name }}/terraform.tfstate"
-          -backend-config="region={{ region }}"
-          -backend-config="encrypt=true"
-        chdir: "{{ playbook_dir }}"
-      register: tf_init_result
-      environment:
-        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
-        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
-        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
-        AWS_REGION: "us-east-1"
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - cluster_name is defined
+          - aws_region is defined
+          - vpc_id is defined
+          - private_subnet_ids is defined
+        fail_msg: "Missing required variables. Check your vars files."
+        success_msg: "All required variables present"
+      tags: [always]
 
-    - name: "[IaC] Write the tfvars file"
-      ansible.builtin.copy:
-        dest: "{{ playbook_dir }}/terraform.tfvars.json"
-        content: "{{ tf_vars_input | to_nice_json }}"
+    - name: Display deployment information
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          WOPI Complete Deployment
+          ========================================
+          Environment: {{ env }}
+          Cluster: {{ cluster_name }}
+          Region: {{ aws_region }}
+          Mode: {{ 'DRY RUN' if dry_run | default(false) else 'LIVE DEPLOYMENT' }}
+          Deploy Applications: {{ 'YES' if deploy_apps else 'NO (Infrastructure Only)' }}
+          Rollback: {{ 'ENABLED' if enable_rollback | default(false) else 'DISABLED' }}
+          ========================================
+      tags: [always]
 
-    - name: "[IaC] Create a workspace"
-      ansible.builtin.command:
-        cmd: "terraform workspace select -or-create {{ cluster_name }}"
-        chdir: "{{ playbook_dir }}"
-      environment:
-        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
-        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
-        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
-        AWS_REGION: "us-east-1"
+  tasks:
+    - name: Load environment-specific variables
+      ansible.builtin.include_vars:
+        dir: "vars/{{ env }}"
+      tags: [always]
 
-    - name: "[IaC] Terraform plan"
+    # Phase 1: Infrastructure
+    - name: Deploy Infrastructure
       block:
-        - name: "[IaC] Run plan"
-          ansible.builtin.command:
-            cmd: "terraform plan -var-file=terraform.tfvars.json -out=tfplan"
-            chdir: "{{ playbook_dir }}"
-      environment:
-        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
-        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
-        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
-        AWS_REGION: "us-east-1"
+        - name: Setup Terraform environment
+          ansible.builtin.include_tasks:
+            file: tasks/terraform-common.yml
+          tags: [terraform, setup]
 
-    - name: "[IaC] Register json output"
-      ansible.builtin.command:
-        cmd: terraform show -json tfplan -no-color
-        chdir: "{{ playbook_dir }}"
-      register: tf_show_plan_result
-      environment:
-        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
-        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
-        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
-        AWS_REGION: "us-east-1"
+        - name: Execute infrastructure deployment
+          ansible.builtin.include_tasks:
+            file: tasks/terraform-deploy.yml
+          tags: [terraform, deploy]
 
-    - name: Output the plan before apply
-      debug:
-        msg: "{{ tf_show_plan_result.stdout }}"
+        - name: Infrastructure deployment complete
+          ansible.builtin.debug:
+            msg: "✓ Infrastructure deployment completed successfully"
+      rescue:
+        - name: Infrastructure deployment failed
+          ansible.builtin.fail:
+            msg: "Infrastructure deployment failed. Applications will not be deployed."
+      tags: [infrastructure]
 
-    - name: Terraform apply
+    # Phase 2: Applications (using kubectl instead of kubernetes.core)
+    - name: Deploy Applications
+      when:
+        - deploy_apps | bool
+        - not dry_run | default(false)
       block:
-        - name: "[IaC] Run apply"
-          ansible.builtin.command:
-            cmd: terraform apply -json -input=false -auto-approve=true tfplan -no-color
-            chdir: "{{ playbook_dir }}"
-          register: tf_apply_result
-          ignore_errors: yes
+        - name: Wait for cluster to be ready
+          ansible.builtin.pause:
+            seconds: 30
+            prompt: "Waiting for EKS cluster to stabilize..."
 
-        - name: "[IaC] Validate apply success"
+        - name: Update kubeconfig
+          ansible.builtin.command:
+            cmd: "aws eks update-kubeconfig --name {{ cluster_name }} --region {{ aws_region }}"
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+            AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+          register: kubeconfig_update
+
+        - name: Verify cluster access
+          ansible.builtin.command:
+            cmd: kubectl cluster-info
+          register: cluster_info
+          changed_when: false
+
+        - name: Display cluster info
+          ansible.builtin.debug:
+            msg: "✓ Connected to cluster: {{ cluster_name }}"
+
+        - name: Check if namespace exists
+          ansible.builtin.command:
+            cmd: kubectl get namespace wopi-services
+          register: namespace_check
+          failed_when: false
+          changed_when: false
+
+        - name: Verify namespace exists
           ansible.builtin.assert:
-            that: not tf_apply_result['failed']
-            fail_msg: "Apply failed.. '{{ tf_apply_result.stdout }} break {{ tf_apply_result.stderr }}'"
-            success_msg: "Apply is success. {{ tf_apply_result.stdout }}"
+            that: namespace_check.rc == 0
+            fail_msg: "Namespace wopi-services not found. Infrastructure deployment may have failed."
+            success_msg: "Namespace wopi-services exists"
 
-        - name: "[IaC] Verify resources were created in state"
+        - name: Deploy ConfigMaps
           ansible.builtin.command:
-            cmd: "terraform state list"
-            chdir: "{{ playbook_dir }}"
-          register: post_apply_state_list
-          environment:
-            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
-            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
-            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
-            AWS_REGION: "us-east-1"
+            cmd: "kubectl apply -f {{ k8s_manifest_dir }}/configmaps/frontend-config.yml -n wopi-services"
+          register: configmap_result
+          changed_when: "'configured' in configmap_result.stdout or 'created' in configmap_result.stdout"
 
-        - name: Show resources created
-          debug:
-            msg: "Resources created and tracked in state: {{ post_apply_state_list.stdout }}"
-
-        - name: "[IaC] Verify EKS cluster exists in AWS"
+        - name: Deploy Backend
           ansible.builtin.command:
-            cmd: "aws eks describe-cluster --name {{ cluster_name }} --region us-east-1"
-          register: eks_verify
-          ignore_errors: yes
-          environment:
-            AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
-            AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
-            AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
-            AWS_REGION: "us-east-1"
+            cmd: "kubectl apply -f {{ item }} -n wopi-services"
+          loop:
+            - "{{ k8s_manifest_dir }}/deployments/backend.yml"
+            - "{{ k8s_manifest_dir }}/services/backend-service.yml"
+          register: backend_result
+          changed_when: "'configured' in backend_result.stdout or 'created' in backend_result.stdout"
 
-        - name: Confirm EKS cluster deployment
-          debug:
-            msg: "EKS cluster {{ cluster_name }} successfully created: {{ eks_verify.rc == 0 }}"
-      environment:
-        AWS_ACCESS_KEY_ID: "{{ aws_assumed_role.sts_creds.access_key }}"
-        AWS_SECRET_ACCESS_KEY: "{{ aws_assumed_role.sts_creds.secret_key }}"
-        AWS_SESSION_TOKEN: "{{ aws_assumed_role.sts_creds.session_token }}"
-        AWS_REGION: "us-east-1"
+        - name: Wait for Backend rollout
+          ansible.builtin.command:
+            cmd: "kubectl rollout status deployment/wopi-backend -n wopi-services --timeout=300s"
+          register: backend_rollout
+          changed_when: false
+
+        - name: Deploy Broker
+          ansible.builtin.command:
+            cmd: "kubectl apply -f {{ item }} -n wopi-services"
+          loop:
+            - "{{ k8s_manifest_dir }}/deployments/broker.yml"
+            - "{{ k8s_manifest_dir }}/services/broker-service.yml"
+          register: broker_result
+          changed_when: "'configured' in broker_result.stdout or 'created' in broker_result.stdout"
+
+        - name: Wait for Broker rollout
+          ansible.builtin.command:
+            cmd: "kubectl rollout status deployment/wopi-server -n wopi-services --timeout=300s"
+          register: broker_rollout
+          changed_when: false
+
+        - name: Deploy Frontend
+          ansible.builtin.command:
+            cmd: "kubectl apply -f {{ item }} -n wopi-services"
+          loop:
+            - "{{ k8s_manifest_dir }}/deployments/frontend.yml"
+            - "{{ k8s_manifest_dir }}/services/frontend-service.yml"
+          register: frontend_result
+          changed_when: "'configured' in frontend_result.stdout or 'created' in frontend_result.stdout"
+
+        - name: Wait for Frontend rollout
+          ansible.builtin.command:
+            cmd: "kubectl rollout status deployment/wopi-frontend -n wopi-services --timeout=300s"
+          register: frontend_rollout
+          changed_when: false
+
+        - name: Wait for all pods to be ready
+          ansible.builtin.command:
+            cmd: "kubectl wait --for=condition=ready pod -l 'app in (wopi-backend,wopi-server,wopi-frontend)' -n wopi-services --timeout=300s"
+          register: pods_ready
+          changed_when: false
+          failed_when: false
+
+        - name: Get pod status
+          ansible.builtin.command:
+            cmd: "kubectl get pods -n wopi-services -o wide"
+          register: pod_status
+          changed_when: false
+
+        - name: Display pod status
+          ansible.builtin.debug:
+            msg: "{{ pod_status.stdout_lines }}"
+
+        - name: Get Frontend LoadBalancer URL (retry up to 10 times)
+          ansible.builtin.command:
+            cmd: "kubectl get svc wopi-frontend-service -n wopi-services -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+          register: frontend_service
+          changed_when: false
+          retries: 10
+          delay: 10
+          until: frontend_service.stdout != ""
+
+        - name: Get deployment status
+          ansible.builtin.command:
+            cmd: "kubectl get deployments -n wopi-services -o jsonpath='{range .items[*]}{.metadata.name}{\",\"}{.status.availableReplicas}{\"\/\"}{.spec.replicas}{\"\\n\"}{end}'"
+          register: deployment_status
+          changed_when: false
+
+        - name: Parse deployment status
+          ansible.builtin.set_fact:
+            backend_status: "{{ deployment_status.stdout_lines | select('match', '^wopi-backend,.*') | first | default('wopi-backend,0/1') | regex_replace('^wopi-backend,(.*)$', '\\1') }}"
+            broker_status: "{{ deployment_status.stdout_lines | select('match', '^wopi-server,.*') | first | default('wopi-server,0/2') | regex_replace('^wopi-server,(.*)$', '\\1') }}"
+            frontend_status: "{{ deployment_status.stdout_lines | select('match', '^wopi-frontend,.*') | first | default('wopi-frontend,0/1') | regex_replace('^wopi-frontend,(.*)$', '\\1') }}"
+
+        - name: Applications deployment complete
+          ansible.builtin.debug:
+            msg: "✓ Applications deployed successfully"
+
+      rescue:
+        - name: Application deployment failed
+          ansible.builtin.debug:
+            msg: |
+              ⚠️  Application deployment failed
+              Infrastructure is deployed, but applications need manual deployment
+              Run: ansible-playbook deploy-applications.yml -e env={{ env }}
+
+      tags: [applications]
+
+  post_tasks:
+    - name: Complete deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          Complete Deployment Summary
+          ========================================
+          Cluster: {{ cluster_name }}
+          Environment: {{ env }}
+
+          Infrastructure: ✓ SUCCESS
+          Applications: {{ '✓ SUCCESS' if deploy_apps and not dry_run | default(false) else '○ SKIPPED' }}
+
+          {% if deploy_apps and not dry_run | default(false) %}
+          Deployment Status:
+          - Backend: {{ backend_status | default('Unknown') }}
+          - Broker: {{ broker_status | default('Unknown') }}
+          - Frontend: {{ frontend_status | default('Unknown') }}
+
+          Frontend URL: https://{{ frontend_service.stdout | default('Pending...') }}
+
+          Verify deployment:
+          kubectl get pods -n wopi-services
+          kubectl get svc -n wopi-services
+          {% endif %}
+
+          Next steps:
+          {% if not deploy_apps %}
+          1. Deploy applications: ansible-playbook deploy-applications.yml -e env={{ env }}
+          {% else %}
+          1. Access frontend at the URL above
+          {% endif %}
+          2. Check application logs: kubectl logs -n wopi-services -l app=wopi-backend
+          3. Run smoke tests
+          ========================================
+      tags: [always]
+
+  environment:
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    NO_PROXY: ".olympus.gaia.kosmos,.tartarus.gaia.kosmos,.gaia.kosmos,.hylandcloud.com,.onbaseonline.com"
+    http_proxy: ""
+    https_proxy: ""
+    no_proxy: ".olympus.gaia.kosmos,.tartarus.gaia.kosmos,.gaia.kosmos,.hylandcloud.com,.onbaseonline.com,.github.com"

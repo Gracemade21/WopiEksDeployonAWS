@@ -38,50 +38,29 @@ variable "log_retention_days" {
   type        = number
 }
 
-# RDS Variables
-variable "db_allocated_storage" {
-  description = "The allocated storage in gigabytes for the RDS instance"
+# External Database Variables
+variable "db_secret_name" {
+  description = "Name of AWS Secrets Manager secret containing database credentials"
+  type        = string
+  default     = "wopi/database/credentials"
+}
+
+variable "db_host" {
+  description = "Database host (geo DNS alias for SQL Server AG)"
+  type        = string
+  default     = "db-wopi"
+}
+
+variable "db_port" {
+  description = "Database port"
   type        = number
+  default     = 1433
 }
 
-variable "db_max_allocated_storage" {
-  description = "The upper limit to which Amazon RDS can automatically scale the storage"
-  type        = number
-}
-
-variable "db_engine_version" {
-  description = "The engine version for SQL Server Express"
+variable "db_name" {
+  description = "Database name"
   type        = string
-}
-
-variable "db_instance_class" {
-  description = "The instance type of the RDS instance"
-  type        = string
-}
-
-variable "db_backup_retention_period" {
-  description = "The days to retain backups for"
-  type        = number
-}
-
-variable "db_backup_window" {
-  description = "The daily time range during which automated backups are created"
-  type        = string
-}
-
-variable "db_maintenance_window" {
-  description = "The window to perform maintenance in"
-  type        = string
-}
-
-variable "skip_final_snapshot" {
-  description = "Determines whether a final DB snapshot is created"
-  type        = bool
-}
-
-variable "deletion_protection" {
-  description = "If the DB instance should have deletion protection enabled"
-  type        = bool
+  default     = "wopi"
 }
 
 # Redis Variables

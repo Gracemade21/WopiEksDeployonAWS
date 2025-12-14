@@ -1,0 +1,94 @@
+---
+# Terraform rollback tasks (OPTIONAL - use with enable_rollback flag)
+
+- name: Rollback notice
+  ansible.builtin.debug:
+    msg: "Initiating rollback procedure for {{ cluster_name }}"
+
+- name: Get current state backup location
+  ansible.builtin.command:
+    cmd: "terraform state pull"
+    chdir: "{{ playbook_dir }}"
+  register: current_state
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+    AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+    AWS_REGION: "{{ region }}"
+  ignore_errors: true
+
+- name: Save failed state
+  ansible.builtin.copy:
+    content: "{{ current_state.stdout }}"
+    dest: "{{ playbook_dir }}/failed-state-{{ ansible_date_time.iso8601_basic_short }}.json"
+    mode: "0644"
+  when: current_state.rc == 0
+
+- name: Check for state backup
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/.terraform/terraform.tfstate.backup"
+  register: backup_exists
+
+- name: Rollback from backup
+  when: backup_exists.stat.exists
+  block:
+    - name: Restore state from backup
+      ansible.builtin.command:
+        cmd: "terraform state push {{ playbook_dir }}/.terraform/terraform.tfstate.backup"
+        chdir: "{{ playbook_dir }}"
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+      register: rollback_result
+      ignore_errors: true
+
+    - name: Rollback status
+      ansible.builtin.debug:
+        msg: "Rollback {{ 'succeeded' if rollback_result.rc == 0 else 'failed' }}"
+
+    - name: Refresh state after rollback
+      ansible.builtin.command:
+        cmd: "terraform refresh -var-file=terraform.tfvars.json"
+        chdir: "{{ playbook_dir }}"
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_key }}"
+        AWS_SESSION_TOKEN: "{{ aws_session_token }}"
+        AWS_REGION: "{{ region }}"
+      when: rollback_result.rc == 0
+
+- name: No backup available
+  ansible.builtin.debug:
+    msg: "No state backup available for rollback. Manual recovery may be required."
+  when: not backup_exists.stat.exists
+
+- name: Create incident report
+  ansible.builtin.copy:
+    content: |
+      Rollback Report
+      ===============
+      Timestamp: {{ ansible_date_time.iso8601 }}
+      Cluster: {{ cluster_name }}
+      Environment: {{ environment }}
+      
+      Failure Details:
+      {{ apply_error | default('No error details captured') }}
+      
+      Rollback Status: {{ 'Completed' if backup_exists.stat.exists and rollback_result.rc == 0 else 'Failed or unavailable' }}
+      
+      State Backup: {{ 'Available' if backup_exists.stat.exists else 'Not found' }}
+      Failed State Saved: {{ playbook_dir }}/failed-state-{{ ansible_date_time.iso8601_basic_short }}.json
+      
+      Next Steps:
+      1. Review the failed state file
+      2. Check AWS console for resource status
+      3. Determine if manual cleanup is needed
+      4. Review error logs above
+    dest: "{{ playbook_dir }}/rollback-report-{{ ansible_date_time.iso8601_basic_short }}.txt"
+    mode: "0644"
+
+- name: Display rollback report location
+  ansible.builtin.debug:
+    msg: "Rollback report saved to: {{ playbook_dir }}/rollback-report-{{ ansible_date_time.iso8601_basic_short }}.txt"

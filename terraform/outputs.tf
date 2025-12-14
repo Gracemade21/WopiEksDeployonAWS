@@ -14,22 +14,6 @@ output "cluster_arn" {
   value       = module.eks.cluster_arn
 }
 
-# Database Outputs
-output "db_instance_endpoint" {
-  description = "RDS instance endpoint"
-  value       = module.rds.db_instance_endpoint
-}
-
-output "db_instance_address" {
-  description = "RDS instance hostname"
-  value       = module.rds.db_instance_address
-}
-
-output "db_instance_port" {
-  description = "RDS instance port"
-  value       = module.rds.db_instance_port
-}
-
 # Redis Outputs
 output "redis_primary_endpoint" {
   description = "Primary endpoint for the Redis replication group"

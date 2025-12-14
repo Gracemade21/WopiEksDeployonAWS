@@ -1,0 +1,66 @@
+# Production environment variables
+---
+environment: prod
+cluster_name: ric-wopi-prod
+kubernetes_version: "1.33"
+aws_region: us-east-2
+region: us-east-1
+
+# Network configuration
+vpc_id: vpc-XXXXXXXXX # UPDATE with production VPC
+private_subnet_ids:
+  - subnet-XXXXXXXXX # UPDATE with production subnets
+  - subnet-YYYYYYYYY
+vpc_cidr: 10.0.0.0/16 # UPDATE with production CIDR
+
+# Logging - longer retention for production
+log_retention_days: 90
+
+# External Database Configuration
+db_secret_name: wopi/database/credential-prod # Update with actual secret name
+db_host: db-wopi
+db_port: 1433
+db_name: wopi
+
+# Redis Configuration - HA setup for production
+redis_node_type: cache.r6g.large
+redis_parameter_group: default.redis7
+redis_num_cache_clusters: 2 # Multi-AZ for HA
+
+# AWS Configuration
+aws_wopi_prod_role_arn: "arn:aws:iam::450388177897:role/Power_User_SVC"
+tf_s3_bucket: terraform-hob-wopi-tfstate
+
+# Terraform variables
+tf_vars_input:
+  environment: "{{ environment }}"
+  cluster_name: "{{ cluster_name }}"
+  kubernetes_version: "{{ kubernetes_version }}"
+  aws_region: "{{ aws_region }}"
+  vpc_id: "{{ vpc_id }}"
+  private_subnet_ids: "{{ private_subnet_ids }}"
+  vpc_cidr: "{{ vpc_cidr }}"
+  log_retention_days: "{{ log_retention_days }}"
+  db_secret_name: "{{ db_secret_name }}"
+  db_host: "{{ db_host }}"
+  db_port: "{{ db_port }}"
+  db_name: "{{ db_name }}"
+  redis_node_type: "{{ redis_node_type }}"
+  redis_parameter_group: "{{ redis_parameter_group }}"
+  redis_num_cache_clusters: "{{ redis_num_cache_clusters }}"
+  tags:
+    Environment: "{{ environment }}"
+    ManagedBy: Terraform
+    Project: WOPI
+
+# Playbook behavior flags - safer defaults for production
+dry_run: false
+validate_only: false
+enable_rollback: true # ALWAYS enabled for prod
+skip_if_no_changes: true
+save_plan: true
+show_plan_details: true
+show_destroy_plan: true
+cleanup_workspace: false
+force_cleanup: false
+skip_confirmation: false # NEVER skip confirmation in prod
