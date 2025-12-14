@@ -59,7 +59,6 @@
 - name: Display what's written to tfvars
   ansible.builtin.debug:
     msg: "{{ tf_vars_input | to_nice_json }}"
-    verbose: 1
   tags: [terraform, vars]
 
 - name: Select or create Terraform workspace
